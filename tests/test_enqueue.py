@@ -128,3 +128,20 @@ def test_retry_policy_is_stored_on_the_job(queue: JobQueue) -> None:
     job_id = queue.enqueue("t", retry=RetryPolicy(3, 0.5, 4.0)).job_id
     job = queue.get_job(job_id)
     assert (job.max_attempts, job.backoff_base_seconds, job.backoff_cap_seconds) == (3, 0.5, 4.0)
+
+
+def test_repeatable_read_caller_sees_a_serialization_failure_on_a_concurrent_key(
+    dsn: str, queue: JobQueue
+) -> None:
+    """In REPEATABLE READ or SERIALIZABLE, a key committed by another transaction after the
+    caller's snapshot is a serialization failure (SQLSTATE 40001): retry the transaction."""
+    with psycopg.connect(dsn) as conn:
+        conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+        conn.execute("SELECT 1")  # take the snapshot
+        other = queue.enqueue("t", {"a": 1}, idempotency_key="rr")
+        with pytest.raises(psycopg.errors.SerializationFailure):
+            queue.enqueue("t", {"a": 1}, idempotency_key="rr", conn=conn)
+        conn.rollback()
+        again = queue.enqueue("t", {"a": 1}, idempotency_key="rr", conn=conn)  # the retry
+        conn.commit()
+    assert again.job_id == other.job_id and not again.created

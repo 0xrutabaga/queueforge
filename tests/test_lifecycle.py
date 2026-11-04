@@ -1,5 +1,6 @@
 """JobQueue state changes: claim, complete, fail, backoff, dead-letter, fencing, reaper, cancel."""
 
+import time
 from uuid import UUID, uuid4
 
 import psycopg
@@ -388,3 +389,34 @@ def test_completion_can_commit_atomically_with_the_handlers_writes(
         queue.complete(job_id, token, conn=conn)
     assert queue.get_job(job_id).state is JobState.SUCCEEDED
     assert sql(dsn, "SELECT 1 FROM qf_test_ledger WHERE job_id = %s", (job_id,)) == [(1,)]
+
+
+def test_completion_in_a_long_caller_transaction_checks_the_current_time(
+    dsn: str, queue: JobQueue
+) -> None:
+    """Regression: expiry was judged with now(), the caller transaction's start time, so a
+    complete(conn=...) issued after the lease expired mid-transaction was accepted."""
+    queue.enqueue("t")
+    job = queue.claim("w", lease_seconds=1.0)[0]
+    assert job.lease_token is not None
+    with psycopg.connect(dsn) as conn:
+        conn.execute("SELECT 1")  # the handler's transaction starts while the lease is valid
+        time.sleep(1.5)
+        with pytest.raises(LeaseLost):
+            queue.complete(job.id, job.lease_token, conn=conn)
+    assert queue.get_job(job.id).state is JobState.RUNNING
+
+
+def test_completion_in_a_caller_transaction_holds_the_row_until_commit(
+    dsn: str, queue: JobQueue
+) -> None:
+    """Once complete(conn=...) has run, the reaper cannot take the row before COMMIT, even if
+    the lease runs out in between: the row lock is held by the caller's transaction."""
+    queue.enqueue("t")
+    job = queue.claim("w", lease_seconds=1.0)[0]
+    assert job.lease_token is not None
+    with psycopg.connect(dsn) as conn:
+        queue.complete(job.id, job.lease_token, conn=conn)
+        time.sleep(1.2)
+        assert queue.reap_expired() == []  # SKIP LOCKED: the uncommitted completion wins
+    assert queue.get_job(job.id).state is JobState.SUCCEEDED
