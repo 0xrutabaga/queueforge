@@ -1,0 +1,57 @@
+[project]
+name = "queueforge"
+version = "0.1.0"
+description = "A durable job queue on PostgreSQL: leases, heartbeats, fencing, retries with backoff, dead-lettering."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "0xrutabaga" }]
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "psycopg-pool>=3.2",
+]
+
+[project.scripts]
+queueforge = "queueforge.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-timeout>=2.3",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/queueforge"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use assert, non-cryptographic randomness and start worker subprocesses with sys.executable.
+"tests/**" = ["S101", "S311", "S603"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+timeout = 120
