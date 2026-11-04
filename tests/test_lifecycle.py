@@ -141,6 +141,7 @@ def test_heartbeat_extends_only_valid_leases(dsn: str, queue: JobQueue) -> None:
     job, token = claim_one(queue)
     [result] = queue.heartbeat([(job_id, token), (job_id, uuid4())], lease_seconds=600)
     assert result.job_id == job_id and not result.cancel_requested
+    assert result.lease_token == token  # results identify the attempt, not just the job
     renewed = queue.get_job(job_id)
     assert renewed.lease_expires_at is not None and job.lease_expires_at is not None
     assert renewed.lease_expires_at > job.lease_expires_at

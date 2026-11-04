@@ -74,6 +74,7 @@ class EnqueueResult:
 @dataclass(frozen=True, slots=True)
 class HeartbeatResult:
     job_id: int
+    lease_token: UUID  # identifies the attempt: one job can have a stale and a live attempt
     cancel_requested: bool
 
 
