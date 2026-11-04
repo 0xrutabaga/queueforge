@@ -309,6 +309,12 @@ Docker Desktop's network layer. They are not a capacity claim for any other setu
 - `enqueue(conn=...)` inside a REPEATABLE READ or SERIALIZABLE transaction raises
   `psycopg.errors.SerializationFailure` when another transaction committed the same idempotency
   key after the caller's snapshot. Retry the transaction, as with any serialization failure.
+- **Leases follow the database server's wall clock.** If that clock steps forward, leases
+  expire early. That causes extra retries, but they are still fenced. If it steps backward,
+  leases last longer and crash recovery is delayed. PostgreSQL exposes no monotonic clock to
+  SQL. On the development machine (Docker Desktop on Windows), the container's clock was
+  measured stepping by -65 s and then +68 s within a fraction of a second. Run the database on
+  a host with a stable, slewing NTP clock, and keep leases well above the size of a clock step.
 - A zombie attempt still counts against its worker's `--concurrency` until its thread returns,
   so a stuck handler reduces that worker's capacity.
 
