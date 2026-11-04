@@ -24,15 +24,25 @@ runnable ids with `FOR UPDATE SKIP LOCKED`. The second updates them to `running`
 
 A claim sets `lease_expires_at = now() + lease`. Every later change for that claim goes through
 `_LOCK_LEASE`, or through `_COMPLETE` / `_HEARTBEAT`. Each of these requires
-`lease_token = $token AND state = 'running' AND lease_expires_at > now()`. If no row matches,
-the caller gets `LeaseLost`.
+`lease_token = $token AND state = 'running' AND lease_expires_at > clock_timestamp()`. If no
+row matches, the caller gets `LeaseLost`. The reaper uses the mirror condition,
+`lease_expires_at <= clock_timestamp()`.
 
 - *Why the expiry check as well as the token:* without it, a worker whose lease expired could
   still complete the job until the reaper ran. With it, "valid lease" means the same thing
   everywhere, and the result does not depend on when the reaper last ran
   (`test_completion_after_lease_expiry_is_rejected_even_before_reaping`).
-- *Why the database clock:* workers on different hosts disagree about time. `now()` from one
-  server does not.
+- *Why the database clock:* workers on different hosts disagree about time. One server's
+  clock does not.
+- *Why `clock_timestamp()` and not `now()`:* `now()` is the start time of the transaction.
+  `complete(conn=...)` runs inside the caller's transaction, which may have started well before
+  the lease ran out. With `now()`, a completion issued after expiry was accepted. A review found
+  this; the regression test is
+  `test_completion_in_a_long_caller_transaction_checks_the_current_time`. New lease deadlines
+  are still computed from `now()`, but those statements run in short pool transactions.
+- *Commit after the check:* once `complete(conn=...)` has updated the row, the caller's
+  transaction holds its lock until COMMIT. The reaper uses `SKIP LOCKED`, so it cannot take the
+  row in that window (`test_completion_in_a_caller_transaction_holds_the_row_until_commit`).
 - *Cost:* a worker that pauses past its lease loses work it had already finished. That is the
   correct trade for a queue whose job is to avoid two owners.
 - *Downstream fencing:* the UUID token only protects the queue's own rows. For external systems,
@@ -129,6 +139,12 @@ A job can then be created atomically with the business row that caused it (outbo
 A handler's writes to this same database can be committed together with its completion: the
 writes become effectively-once, while the queue as a whole is still at-least-once.
 
+A caller transaction at REPEATABLE READ or SERIALIZABLE cannot see an idempotency key that
+another transaction committed after its snapshot. PostgreSQL then fails the
+`INSERT ... ON CONFLICT DO NOTHING` with a serialization failure (SQLSTATE 40001) rather than
+returning nothing. queueforge lets that error propagate, and the caller retries the
+transaction (`test_repeatable_read_caller_sees_a_serialization_failure_on_a_concurrent_key`).
+
 ## 11. Polling instead of LISTEN/NOTIFY
 
 Workers poll every `poll_seconds` when idle. When a claim fills all free slots, they claim again
@@ -138,6 +154,15 @@ immediately. Polling is simple and has no missed-notification edge cases, and th
 ## 12. Threads, a connection pool, one transaction per call
 
 `JobQueue` borrows a connection from a `psycopg_pool.ConnectionPool` for each call, so it is
-thread-safe. The worker needs about `concurrency + 2` connections. Handler threads are daemon
+thread-safe.
+
+The worker tracks running handlers by **lease token**, not job id. After a lost lease, the same
+worker may claim attempt 2 of a job while attempt 1's thread is still running. When the
+tracking was keyed by job id, attempt 1 finishing removed attempt 2's entry. Attempt 2 then got
+no heartbeats, its lease expired, and attempt 3 started while attempt 2 was still running. A
+review found this; the regression test is
+`tests/test_worker.py::test_stale_attempt_finishing_does_not_drop_the_new_attempts_heartbeats`.
+Stale threads still count against `concurrency` and are waited for on shutdown, because they
+really are running. The worker needs about `concurrency + 2` connections. Handler threads are daemon
 threads, so a process can exit even if a handler is stuck. The CLI then exits with status 1 to
 signal abandoned jobs.
