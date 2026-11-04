@@ -32,10 +32,13 @@ Delivery semantics, stated precisely:
 - **At most one valid lease per job at any time.** Only a claim creates a lease. A claim only
   takes `queued` or `failed` rows, with a row lock and `SKIP LOCKED`.
 - **Fencing.** Every state change made for a claim (heartbeat, complete, fail, release,
-  acknowledge cancel) must present that claim's `lease_token` and happen before
-  `lease_expires_at`, measured by the database clock. Otherwise it changes nothing and raises
+  acknowledge cancel) must present that claim's `lease_token`. The statement must also run
+  before `lease_expires_at`, judged by the database's `clock_timestamp()` when that statement
+  executes (not the transaction start time). Otherwise it changes nothing and raises
   `LeaseLost`. A stale worker cannot complete, fail or release a job that has since been
-  re-claimed.
+  re-claimed. With `complete(conn=...)` the check happens when `complete` runs; from then on
+  the caller's transaction holds the row lock, so the reaper cannot take the job before that
+  transaction commits or rolls back.
 - **Monotonic attempt number.** `attempts` never decreases; the trigger enforces this.
   `JobContext.fencing_token` is `(job_id, attempt)`, which downstream systems can use to reject
   writes from older attempts.
@@ -303,6 +306,11 @@ Docker Desktop's network layer. They are not a capacity claim for any other setu
 - **Update-heavy table.** Every heartbeat is an UPDATE. At high job rates autovacuum settings
   and the heartbeat interval need tuning; this has not been measured beyond `scripts/bench.py`.
 - Releasing on shutdown keeps the attempt counter, so frequent restarts consume attempts.
+- `enqueue(conn=...)` inside a REPEATABLE READ or SERIALIZABLE transaction raises
+  `psycopg.errors.SerializationFailure` when another transaction committed the same idempotency
+  key after the caller's snapshot. Retry the transaction, as with any serialization failure.
+- A zombie attempt still counts against its worker's `--concurrency` until its thread returns,
+  so a stuck handler reduces that worker's capacity.
 
 ## Future work
 

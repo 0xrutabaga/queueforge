@@ -16,12 +16,21 @@ Two things need separating:
   records a violation if another session holds it.
 - **Two handler executions at once: possible after a lease is lost.** If a worker pauses longer
   than its lease, another worker can claim the job while the first thread still runs. The queue
-  fences the stale attempt: `_COMPLETE` and `_LOCK_LEASE` require the current token and an
-  unexpired lease, so its result is rejected with `LeaseLost`. But the queue cannot undo
-  external side effects. Mitigations in code: `JobContext.lease_deadline` stops cooperative
-  handlers once renewals have failed for a lease period, `Worker._drain` never releases a
-  still-running job, and `JobContext.fencing_token` is available for downstream checks. The
-  honest summary is at-least-once with fencing, not exactly-once.
+  fences the stale attempt: `_COMPLETE` and `_LOCK_LEASE` require the current token and a
+  lease that has not expired by `clock_timestamp()`, so its result is rejected with
+  `LeaseLost`. But the queue cannot undo external side effects. Mitigations in code:
+  `JobContext.lease_deadline` stops cooperative handlers once renewals have failed for a lease
+  period, `Worker._drain` never releases a still-running job, and `JobContext.fencing_token` is
+  available for downstream checks. The honest summary is at-least-once with fencing, not
+  exactly-once.
+- **Two bugs an independent review found here, both now fixed with regression tests.**
+  - The worker tracked running handlers by job id. When a stale attempt finished, it removed
+    the entry for the live next attempt on the same worker, so that attempt lost its heartbeats
+    and a third attempt overlapped it. The worker now tracks them by lease token
+    (`test_stale_attempt_finishing_does_not_drop_the_new_attempts_heartbeats`).
+  - The expiry checks used `now()`, the transaction start time. That let
+    `complete(conn=...)` succeed after the lease had expired inside a long caller transaction.
+    They now use `clock_timestamp()`.
 
 ## 2. "Walk me through a worker crash."
 
