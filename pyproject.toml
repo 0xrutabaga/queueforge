@@ -55,3 +55,5 @@ files = ["src"]
 testpaths = ["tests"]
 addopts = "-ra"
 timeout = 120
+# An exception escaping a worker or helper thread must fail the test, not just warn.
+filterwarnings = ["error::pytest.PytestUnhandledThreadExceptionWarning"]
