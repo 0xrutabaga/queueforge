@@ -8,7 +8,9 @@ Concurrency rules this module relies on:
   (heartbeat, complete, fail, release, acknowledge cancel) must present the token *and* happen
   before ``lease_expires_at``. Otherwise it changes nothing and raises :class:`LeaseLost`.
   That is the fencing check.
-* All times come from the database clock (``now()``), so worker clock skew does not matter.
+* All times come from the database clock, so worker clock skew does not matter. Lease expiry
+  is always judged with ``clock_timestamp()`` (the time the statement runs), never ``now()``
+  (the transaction's start time), because callers may pass their own long-running transaction.
 """
 
 from __future__ import annotations
@@ -99,7 +101,7 @@ FROM unnest(%(ids)s::bigint[], %(tokens)s::uuid[]) AS l(id, token)
 WHERE j.id = l.id
   AND j.lease_token = l.token
   AND j.state = 'running'
-  AND j.lease_expires_at > now()
+  AND j.lease_expires_at > clock_timestamp()
 RETURNING j.id, j.cancel_requested
 """
 
@@ -111,7 +113,7 @@ WITH done AS (
     WHERE id = %(id)s
       AND lease_token = %(token)s
       AND state = 'running'
-      AND lease_expires_at > now()
+      AND lease_expires_at > clock_timestamp()
     RETURNING id, attempts
 ), history AS (
     UPDATE queueforge_attempts a
@@ -130,7 +132,7 @@ FROM queueforge_jobs
 WHERE id = %(id)s
   AND lease_token = %(token)s
   AND state = 'running'
-  AND lease_expires_at > now()
+  AND lease_expires_at > clock_timestamp()
 FOR UPDATE
 """
 
@@ -138,7 +140,7 @@ _LOCK_EXPIRED = """
 SELECT id, attempts, max_attempts, backoff_base_seconds, backoff_cap_seconds,
        cancel_requested, locked_by
 FROM queueforge_jobs
-WHERE queue = %(queue)s AND state = 'running' AND lease_expires_at <= now()
+WHERE queue = %(queue)s AND state = 'running' AND lease_expires_at <= clock_timestamp()
 ORDER BY lease_expires_at
 LIMIT %(limit)s
 FOR UPDATE SKIP LOCKED
@@ -194,7 +196,7 @@ SELECT
         AS oldest_runnable_age_seconds,
     (SELECT count(*)
      FROM queueforge_jobs
-     WHERE queue = %(queue)s AND state = 'running' AND lease_expires_at <= now())
+     WHERE queue = %(queue)s AND state = 'running' AND lease_expires_at <= clock_timestamp())
         AS expired_leases
 """
 
@@ -290,6 +292,9 @@ class JobQueue:
 
         Reusing a key with a different task or payload raises IdempotencyConflict. Pass `conn`
         to enqueue inside the caller's transaction: the job then exists only if it commits.
+        If that transaction is REPEATABLE READ or SERIALIZABLE and another transaction committed
+        the same key after its snapshot, PostgreSQL raises psycopg.errors.SerializationFailure
+        (SQLSTATE 40001); roll back and retry the transaction.
         """
         if not task:
             raise ValueError("task must not be empty")
@@ -317,8 +322,14 @@ class JobQueue:
             if row is not None:
                 return EnqueueResult(job_id=row["id"], created=True)
             existing = cur.execute(_FIND_BY_KEY, params).fetchone()
-            if existing is None:  # pragma: no cover - conflict row vanished mid-transaction
-                raise QueueForgeError("idempotency conflict but no existing job found")
+            if existing is None:  # pragma: no cover - needs a concurrent DELETE of that row
+                # Under READ COMMITTED this means the conflicting row was deleted between the
+                # two statements. (REPEATABLE READ / SERIALIZABLE callers get a
+                # SerializationFailure from the INSERT instead and should retry.)
+                raise QueueForgeError(
+                    f"idempotency key {idempotency_key!r} conflicted with a job that is no "
+                    "longer visible; retry the enqueue"
+                )
             if not existing["same"]:
                 raise IdempotencyConflict(
                     f"idempotency key {idempotency_key!r} already used by job {existing['id']} "
@@ -369,7 +380,9 @@ class JobQueue:
         """Mark the job succeeded. Raises LeaseLost if the lease is no longer valid.
 
         Pass `conn` to complete inside the caller's transaction, so the job's own database
-        writes and its completion commit or roll back together.
+        writes and its completion commit or roll back together. The lease is checked against
+        clock_timestamp() when this statement runs, not the transaction's start time. After it
+        succeeds the row stays locked until the caller commits, so the reaper cannot take it.
         """
         with self._cursor(conn) as cur:
             row = cur.execute(_COMPLETE, {"id": job_id, "token": lease_token}).fetchone()
