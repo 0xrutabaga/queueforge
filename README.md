@@ -199,12 +199,13 @@ from queueforge import JobContext, PermanentError, Registry
 
 registry = Registry()
 
+
 @registry.task("send_receipt")
 def send_receipt(ctx: JobContext, payload: dict) -> None:
     if "email" not in payload:
-        raise PermanentError("no email address")       # dead-letter now, no retries
+        raise PermanentError("no email address")  # dead-letter now, no retries
     for chunk in render_chunks(payload):
-        ctx.check()                                     # stop promptly if cancelled / shutting down
+        ctx.check()  # stop promptly if cancelled / shutting down
         mailer.send(chunk, idempotency_key=f"receipt-{ctx.job_id}")  # safe to repeat
 ```
 
@@ -219,14 +220,14 @@ import psycopg
 from queueforge import JobQueue, RetryPolicy
 
 queue = JobQueue.connect(DSN, "mail")
-with psycopg.connect(DSN) as conn:          # commits on exit
+with psycopg.connect(DSN) as conn:  # commits on exit
     conn.execute("INSERT INTO orders (id, email) VALUES (%s, %s)", (order_id, email))
     queue.enqueue(
         "send_receipt",
         {"order_id": order_id, "email": email},
         idempotency_key=f"receipt-{order_id}",
         retry=RetryPolicy(max_attempts=8, base_seconds=2, cap_seconds=600),
-        conn=conn,                          # the job exists only if the order commits
+        conn=conn,  # the job exists only if the order commits
     )
 ```
 
