@@ -173,7 +173,9 @@ class Worker:
         self.shutdown_grace_seconds = shutdown_grace_seconds
         self.error_backoff_seconds = error_backoff_seconds
 
-        self._inflight: dict[int, JobContext] = {}
+        # Keyed by lease token, not job id: after a lost lease the same worker can claim the
+        # next attempt of a job while the stale attempt's thread is still running.
+        self._inflight: dict[UUID, JobContext] = {}
         self._lock = threading.Lock()
         self._stopping = threading.Event()
         self._wake = threading.Event()
@@ -187,8 +189,9 @@ class Worker:
         self._wake.set()
 
     def inflight(self) -> list[int]:
+        """Job ids of running handler threads, one entry per thread (stale attempts included)."""
         with self._lock:
-            return sorted(self._inflight)
+            return sorted(ctx.job_id for ctx in self._inflight.values())
 
     def run(self) -> WorkerReport:
         """Process jobs until stop() is called. Returns after the graceful shutdown."""
@@ -285,7 +288,7 @@ class Worker:
                 result = alive.get(ctx.job_id)
                 if result is None:
                     with self._lock:
-                        still_running = ctx.job_id in self._inflight
+                        still_running = ctx.lease_token in self._inflight
                     if still_running:
                         log.warning("job %d: lease lost", ctx.job_id)
                         ctx.request_stop(StopReason.LEASE_LOST)
@@ -324,7 +327,7 @@ class Worker:
     def _start(self, job: Job, lease_deadline: float) -> None:
         ctx = JobContext(job, lease_deadline)
         with self._lock:
-            self._inflight[job.id] = ctx
+            self._inflight[ctx.lease_token] = ctx
         thread = threading.Thread(
             target=self._execute, args=(ctx,), name=f"qf-job-{job.id}", daemon=True
         )
@@ -364,7 +367,7 @@ class Worker:
             )
         finally:
             with self._lock:
-                self._inflight.pop(job.id, None)
+                self._inflight.pop(ctx.lease_token, None)
             self._wake.set()
 
     def _settle_interrupted(self, ctx: JobContext) -> None:
