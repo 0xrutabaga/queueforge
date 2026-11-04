@@ -363,9 +363,15 @@ class JobQueue:
             ).fetchall()
         return [HeartbeatResult(row["id"], row["cancel_requested"]) for row in rows]
 
-    def complete(self, job_id: int, lease_token: UUID) -> None:
-        """Mark the job succeeded. Raises LeaseLost if the lease is no longer valid."""
-        with self._cursor() as cur:
+    def complete(
+        self, job_id: int, lease_token: UUID, *, conn: psycopg.Connection[Any] | None = None
+    ) -> None:
+        """Mark the job succeeded. Raises LeaseLost if the lease is no longer valid.
+
+        Pass `conn` to complete inside the caller's transaction, so the job's own database
+        writes and its completion commit or roll back together.
+        """
+        with self._cursor(conn) as cur:
             row = cur.execute(_COMPLETE, {"id": job_id, "token": lease_token}).fetchone()
         if row is None:
             raise LeaseLost(f"job {job_id}: completion rejected, lease no longer valid")

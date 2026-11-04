@@ -4,6 +4,7 @@ import threading
 import time
 from typing import Any
 
+import psycopg
 import pytest
 from helpers import expire_lease, running, wait_for
 
@@ -253,3 +254,35 @@ def test_registry_rejects_duplicates_and_empty_names() -> None:
 def test_worker_validates_settings(queue: JobQueue, kwargs: dict[str, Any], message: str) -> None:
     with pytest.raises(ValueError, match=message):
         Worker(queue, Registry(), **kwargs)
+
+
+def test_handler_is_stopped_when_heartbeats_keep_failing(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the worker cannot reach the database for a whole lease period, another worker may
+    already own the job, so the handler is told to stop even though no heartbeat said so."""
+    registry = Registry()
+    started = threading.Event()
+    reasons: list[frozenset[StopReason]] = []
+
+    @registry.task("long")
+    def long(ctx: JobContext, payload: Any) -> None:
+        started.set()
+        try:
+            while True:
+                ctx.sleep(0.02)
+        finally:
+            reasons.append(ctx.stop_reasons)
+
+    def unreachable(*args: Any, **kwargs: Any) -> Any:
+        raise psycopg.OperationalError("simulated network partition")
+
+    queue.enqueue("long", retry=NO_DELAY)
+    worker = make_worker(queue, registry, lease_seconds=0.6, heartbeat_seconds=0.1)
+    monkeypatch.setattr(worker.queue, "heartbeat", unreachable)
+    with running(worker):
+        assert started.wait(10)
+        began = time.monotonic()
+        wait_for(lambda: bool(reasons), timeout=5, what="handler to stop")
+        assert time.monotonic() - began < 1.0
+    assert reasons == [frozenset({StopReason.LEASE_LOST})]

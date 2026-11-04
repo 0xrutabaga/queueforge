@@ -43,12 +43,16 @@ class StopReason(StrEnum):
 class JobContext:
     """Handed to every handler call. Handlers should poll it during long work."""
 
-    def __init__(self, job: Job) -> None:
+    def __init__(self, job: Job, lease_deadline: float | None = None) -> None:
         if job.lease_token is None:
             raise ValueError("JobContext needs a leased job")
         self.job = job
         self.lease_token: UUID = job.lease_token
         self.started_monotonic = time.monotonic()
+        # Local monotonic time by which the lease has certainly expired unless renewed. It is
+        # measured from *before* the claim/heartbeat request, so it is never later than the
+        # database's own lease_expires_at.
+        self.lease_deadline = lease_deadline if lease_deadline is not None else float("inf")
         self._event = threading.Event()
         self._reasons: set[StopReason] = set()
         self._lock = threading.Lock()
@@ -220,6 +224,7 @@ class Worker:
             with self._lock:
                 free = self.concurrency - len(self._inflight)
             if free > 0:
+                requested_at = time.monotonic()
                 try:
                     jobs = self.queue.claim(
                         self.worker_id, limit=free, lease_seconds=self.lease_seconds
@@ -231,7 +236,7 @@ class Worker:
                     self._stopping.wait(self.error_backoff_seconds)
                     continue
                 for job in jobs:
-                    self._start(job)
+                    self._start(job, requested_at + self.lease_seconds)
                 if len(jobs) == free:
                     continue  # there may be more work and we may have capacity again soon
             self._wake.wait(self.poll_seconds)
@@ -255,10 +260,18 @@ class Worker:
                     if StopReason.TIMEOUT not in ctx.stop_reasons:
                         log.warning("job %d: exceeded %.1fs timeout", ctx.job_id, elapsed)
                     ctx.request_stop(StopReason.TIMEOUT)
-                elif StopReason.LEASE_LOST not in ctx.stop_reasons:
+                elif StopReason.LEASE_LOST in ctx.stop_reasons:
+                    continue
+                elif time.monotonic() >= ctx.lease_deadline:
+                    # Heartbeats have been failing (for example the database is unreachable)
+                    # for a whole lease period: another worker may own the job now.
+                    log.warning("job %d: lease could not be renewed in time", ctx.job_id)
+                    ctx.request_stop(StopReason.LEASE_LOST)
+                else:
                     renew.append(ctx)
             if not renew:
                 continue
+            requested_at = time.monotonic()
             try:
                 results = self.queue.heartbeat(
                     [(ctx.job_id, ctx.lease_token) for ctx in renew],
@@ -276,8 +289,10 @@ class Worker:
                     if still_running:
                         log.warning("job %d: lease lost", ctx.job_id)
                         ctx.request_stop(StopReason.LEASE_LOST)
-                elif result.cancel_requested:
-                    ctx.request_stop(StopReason.CANCELLED)
+                else:
+                    ctx.lease_deadline = requested_at + self.lease_seconds
+                    if result.cancel_requested:
+                        ctx.request_stop(StopReason.CANCELLED)
 
     def _drain(self) -> list[int]:
         with self._lock:
@@ -306,8 +321,8 @@ class Worker:
 
     # ------------------------------------------------------------------ execution
 
-    def _start(self, job: Job) -> None:
-        ctx = JobContext(job)
+    def _start(self, job: Job, lease_deadline: float) -> None:
+        ctx = JobContext(job, lease_deadline)
         with self._lock:
             self._inflight[job.id] = ctx
         thread = threading.Thread(

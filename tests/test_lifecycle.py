@@ -2,6 +2,7 @@
 
 from uuid import UUID, uuid4
 
+import psycopg
 import pytest
 from helpers import expire_lease, make_due, sql
 
@@ -366,3 +367,24 @@ def test_stats_reports_counts_age_and_expired_leases(dsn: str, queue: JobQueue) 
     assert stats.oldest_runnable_age_seconds is not None
     assert 89 < stats.oldest_runnable_age_seconds < 120
     assert stats.as_dict()["queue"] == queue.queue
+
+
+def test_completion_can_commit_atomically_with_the_handlers_writes(
+    dsn: str, queue: JobQueue
+) -> None:
+    sql(dsn, "CREATE TABLE IF NOT EXISTS qf_test_ledger (job_id bigint PRIMARY KEY)")
+    job_id = queue.enqueue("t").job_id
+    _, token = claim_one(queue)
+
+    with psycopg.connect(dsn) as conn:
+        conn.execute("INSERT INTO qf_test_ledger (job_id) VALUES (%s)", (job_id,))
+        queue.complete(job_id, token, conn=conn)
+        conn.rollback()  # e.g. the process dies before COMMIT
+    assert queue.get_job(job_id).state is JobState.RUNNING
+    assert sql(dsn, "SELECT 1 FROM qf_test_ledger WHERE job_id = %s", (job_id,)) == []
+
+    with psycopg.connect(dsn) as conn:
+        conn.execute("INSERT INTO qf_test_ledger (job_id) VALUES (%s)", (job_id,))
+        queue.complete(job_id, token, conn=conn)
+    assert queue.get_job(job_id).state is JobState.SUCCEEDED
+    assert sql(dsn, "SELECT 1 FROM qf_test_ledger WHERE job_id = %s", (job_id,)) == [(1,)]
