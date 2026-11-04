@@ -278,7 +278,10 @@ def test_handler_is_stopped_when_heartbeats_keep_failing(
         raise psycopg.OperationalError("simulated network partition")
 
     queue.enqueue("long", retry=NO_DELAY)
-    worker = make_worker(queue, registry, lease_seconds=0.6, heartbeat_seconds=0.1)
+    # reap_seconds is large so this worker does not reap and re-run the job inside the test.
+    worker = make_worker(
+        queue, registry, lease_seconds=0.6, heartbeat_seconds=0.1, reap_seconds=3600
+    )
     monkeypatch.setattr(worker.queue, "heartbeat", unreachable)
     with running(worker):
         assert started.wait(10)

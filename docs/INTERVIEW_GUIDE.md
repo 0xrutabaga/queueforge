@@ -110,17 +110,20 @@ Then show fencing by hand in a Python shell:
 ```python
 from queueforge import JobQueue, RetryPolicy, LeaseLost
 from queueforge.cli import DEFAULT_DSN
+
 q = JobQueue.connect(DEFAULT_DSN, "live")
 job_id = q.enqueue("t", retry=RetryPolicy(3, 0, 0)).job_id
 a = q.claim("worker-a", lease_seconds=2)[0]
-import time; time.sleep(2.5)
-q.reap_expired()                          # [(job_id, <JobState.FAILED: 'failed'>)]
+import time
+
+time.sleep(2.5)
+q.reap_expired()  # [(job_id, <JobState.FAILED: 'failed'>)]
 b = q.claim("worker-b")[0]
 try:
-    q.complete(job_id, a.lease_token)     # stale worker
+    q.complete(job_id, a.lease_token)  # stale worker
 except LeaseLost as e:
     print("rejected:", e)
-q.complete(job_id, b.lease_token)         # current owner succeeds
+q.complete(job_id, b.lease_token)  # current owner succeeds
 [(x.worker_id, x.outcome) for x in q.attempts(job_id)]
 ```
 
