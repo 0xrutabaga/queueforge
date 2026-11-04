@@ -289,3 +289,45 @@ def test_handler_is_stopped_when_heartbeats_keep_failing(
         wait_for(lambda: bool(reasons), timeout=5, what="handler to stop")
         assert time.monotonic() - began < 1.0
     assert reasons == [frozenset({StopReason.LEASE_LOST})]
+
+
+def test_stale_attempt_finishing_does_not_drop_the_new_attempts_heartbeats(
+    dsn: str, queue: JobQueue
+) -> None:
+    """Regression: in-flight jobs were keyed by job id. When a stale attempt 1 finished after the
+    same worker had claimed attempt 2, it removed attempt 2's entry, so attempt 2 stopped being
+    heartbeated, its lease expired and attempt 3 started while attempt 2 was still running."""
+    registry = Registry()
+    release_first = threading.Event()
+    second_started = threading.Event()
+
+    @registry.task("t")
+    def t(ctx: JobContext, payload: Any) -> None:
+        if ctx.attempt == 1:
+            release_first.wait(10)  # blocked, ignores ctx: a zombie after its lease is lost
+            return
+        second_started.set()
+        for _ in range(500):
+            ctx.sleep(0.02)
+
+    job_id = queue.enqueue("t", retry=RetryPolicy(10, 0, 0)).job_id
+    worker = make_worker(
+        queue,
+        registry,
+        concurrency=2,
+        lease_seconds=2.0,
+        heartbeat_seconds=0.2,
+        reap_seconds=0.1,
+    )
+    with running(worker):
+        wait_for(lambda: queue.get_job(job_id).attempts == 1, what="attempt 1")
+        expire_lease(dsn, job_id)  # as if attempt 1's worker had stalled past its lease
+        assert second_started.wait(10)
+        assert worker.inflight() == [job_id, job_id]  # zombie attempt 1 and live attempt 2
+        release_first.set()
+        wait_for(lambda: worker.inflight() == [job_id], what="attempt 1 thread to finish")
+        time.sleep(3.0)  # longer than the lease: attempt 2 must still be heartbeated
+        job = queue.get_job(job_id)
+        history = [(a.attempt, a.outcome, a.error) for a in queue.attempts(job_id)]
+        assert (job.state, job.attempts) == (JobState.RUNNING, 2), history
+    assert [a.outcome for a in queue.attempts(job_id)] == ["lease_expired", "released"]
