@@ -213,7 +213,7 @@ def _run(
     first = queue.enqueue("demo.ok", {"order": 42}, idempotency_key="order-42")
     again = queue.enqueue("demo.ok", {"order": 42}, idempotency_key="order-42")
     say(
-        f"enqueued {sum(map(len, jobs.values())) + 5} more jobs; idempotency key 'order-42' "
+        f"enqueued {sum(map(len, jobs.values())) + 4} more jobs; idempotency key 'order-42' "
         f"twice -> job {first.job_id} (created={first.created}), "
         f"job {again.job_id} (created={again.created})"
     )
