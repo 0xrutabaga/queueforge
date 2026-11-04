@@ -45,6 +45,12 @@ row matches, the caller gets `LeaseLost`. The reaper uses the mirror condition,
   row in that window (`test_completion_in_a_caller_transaction_holds_the_row_until_commit`).
 - *Cost:* a worker that pauses past its lease loses work it had already finished. That is the
   correct trade for a queue whose job is to avoid two owners.
+- *Clock steps:* `timestamptz` arithmetic uses the server's wall clock, not a monotonic one. A
+  forward step expires leases early (extra, fenced retries); a backward step delays crash
+  recovery. This was observed, not hypothesised: a regression test with a 2 s lease was flaky
+  because the Docker Desktop VM clock stepped -65 s and then +68 s. Sampling
+  `clock_timestamp()` against the host's monotonic clock showed it. The test now observes
+  heartbeats directly with a 120 s lease. The limitation is in the README.
 - *Downstream fencing:* the UUID token only protects the queue's own rows. For external systems,
   `JobContext.fencing_token` returns `(job_id, attempt)`. `attempt` is monotonic: the trigger
   rejects any decrease, and `release` deliberately does not decrement it.
@@ -163,6 +169,8 @@ no heartbeats, its lease expired, and attempt 3 started while attempt 2 was stil
 review found this; the regression test is
 `tests/test_worker.py::test_stale_attempt_finishing_does_not_drop_the_new_attempts_heartbeats`.
 Stale threads still count against `concurrency` and are waited for on shutdown, because they
-really are running. The worker needs about `concurrency + 2` connections. Handler threads are daemon
+really are running. Heartbeat results are matched to handlers by lease token for the same
+reason. Matching them by job id let the live attempt's renewal hide the fact that the stale
+attempt's lease was gone, so the stale handler was never asked to stop. The worker needs about `concurrency + 2` connections. Handler threads are daemon
 threads, so a process can exit even if a handler is stuck. The CLI then exits with status 1 to
 signal abandoned jobs.

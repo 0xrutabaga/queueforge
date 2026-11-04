@@ -31,6 +31,9 @@ Two things need separating:
   - The expiry checks used `now()`, the transaction start time. That let
     `complete(conn=...)` succeed after the lease had expired inside a long caller transaction.
     They now use `clock_timestamp()`.
+  - Heartbeat results were matched by job id, so a live attempt's renewal masked the stale
+    attempt's lost lease. They are now matched by lease token (same regression test as the
+    first bug).
 
 ## 2. "Walk me through a worker crash."
 
