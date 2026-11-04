@@ -6,7 +6,7 @@ from typing import Any
 
 import psycopg
 import pytest
-from helpers import expire_lease, running, wait_for
+from helpers import expire_lease, running, sql, wait_for
 
 from queueforge import (
     JobContext,
@@ -294,40 +294,63 @@ def test_handler_is_stopped_when_heartbeats_keep_failing(
 def test_stale_attempt_finishing_does_not_drop_the_new_attempts_heartbeats(
     dsn: str, queue: JobQueue
 ) -> None:
-    """Regression: in-flight jobs were keyed by job id. When a stale attempt 1 finished after the
-    same worker had claimed attempt 2, it removed attempt 2's entry, so attempt 2 stopped being
-    heartbeated, its lease expired and attempt 3 started while attempt 2 was still running."""
+    """Regression for two bugs with a stale and a live attempt of one job on the same worker.
+
+    1. In-flight handlers were keyed by job id, so the stale attempt finishing removed the live
+       attempt's entry and the live attempt was never heartbeated again.
+    2. Heartbeat results were keyed by job id, so the live attempt's renewal made the stale
+       attempt look renewed too, and it was never told its lease was lost.
+
+    The lease is long (120 s) on purpose: the test observes heartbeats directly instead of
+    waiting for a lease to run out, so steps in the database server's wall clock cannot make it
+    flaky. (Docker Desktop's VM clock has been seen stepping by about a minute.)
+    """
     registry = Registry()
     release_first = threading.Event()
-    second_started = threading.Event()
+    contexts: dict[int, JobContext] = {}
 
     @registry.task("t")
     def t(ctx: JobContext, payload: Any) -> None:
+        contexts[ctx.attempt] = ctx
         if ctx.attempt == 1:
             release_first.wait(10)  # blocked, ignores ctx: a zombie after its lease is lost
             return
-        second_started.set()
         for _ in range(500):
             ctx.sleep(0.02)
+
+    def heartbeat_at() -> object:
+        return sql(dsn, "SELECT heartbeat_at FROM queueforge_jobs WHERE id = %s", (job_id,))[0][0]
 
     job_id = queue.enqueue("t", retry=RetryPolicy(10, 0, 0)).job_id
     worker = make_worker(
         queue,
         registry,
         concurrency=2,
-        lease_seconds=2.0,
-        heartbeat_seconds=0.2,
-        reap_seconds=0.1,
+        lease_seconds=120.0,
+        heartbeat_seconds=0.1,
+        reap_seconds=0.05,
     )
     with running(worker):
-        wait_for(lambda: queue.get_job(job_id).attempts == 1, what="attempt 1")
+        wait_for(lambda: 1 in contexts, what="attempt 1")
         expire_lease(dsn, job_id)  # as if attempt 1's worker had stalled past its lease
-        assert second_started.wait(10)
+        wait_for(lambda: 2 in contexts, what="attempt 2 on the same worker")
         assert worker.inflight() == [job_id, job_id]  # zombie attempt 1 and live attempt 2
+
+        # Bug 2: the zombie must learn that its lease is gone, although attempt 2 is renewed.
+        wait_for(
+            lambda: StopReason.LEASE_LOST in contexts[1].stop_reasons,
+            timeout=5,
+            what="the stale attempt to be told its lease was lost",
+        )
+        assert StopReason.LEASE_LOST not in contexts[2].stop_reasons
+
+        # Bug 1: after the zombie's thread ends, attempt 2 must still be heartbeated.
         release_first.set()
         wait_for(lambda: worker.inflight() == [job_id], what="attempt 1 thread to finish")
-        time.sleep(3.0)  # longer than the lease: attempt 2 must still be heartbeated
+        for _ in range(3):
+            before = heartbeat_at()
+            wait_for(lambda b=before: heartbeat_at() != b, timeout=5, what="a heartbeat")
         job = queue.get_job(job_id)
-        history = [(a.attempt, a.outcome, a.error) for a in queue.attempts(job_id)]
-        assert (job.state, job.attempts) == (JobState.RUNNING, 2), history
+        assert (job.state, job.attempts) == (JobState.RUNNING, 2)
+        assert contexts[2].stop_reasons == frozenset()
     assert [a.outcome for a in queue.attempts(job_id)] == ["lease_expired", "released"]

@@ -102,7 +102,7 @@ WHERE j.id = l.id
   AND j.lease_token = l.token
   AND j.state = 'running'
   AND j.lease_expires_at > clock_timestamp()
-RETURNING j.id, j.cancel_requested
+RETURNING j.id, j.lease_token, j.cancel_requested
 """
 
 _COMPLETE = """
@@ -360,7 +360,7 @@ class JobQueue:
     def heartbeat(
         self, leases: Sequence[tuple[int, UUID]], *, lease_seconds: float
     ) -> list[HeartbeatResult]:
-        """Extend still-valid leases. Leases missing from the result were lost."""
+        """Extend still-valid leases. Leases whose token is missing from the result were lost."""
         if not leases:
             return []
         with self._cursor() as cur:
@@ -372,7 +372,9 @@ class JobQueue:
                     "tokens": [token for _, token in leases],
                 },
             ).fetchall()
-        return [HeartbeatResult(row["id"], row["cancel_requested"]) for row in rows]
+        return [
+            HeartbeatResult(row["id"], row["lease_token"], row["cancel_requested"]) for row in rows
+        ]
 
     def complete(
         self, job_id: int, lease_token: UUID, *, conn: psycopg.Connection[Any] | None = None

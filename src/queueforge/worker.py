@@ -283,9 +283,10 @@ class Worker:
             except psycopg.Error as exc:
                 log.warning("heartbeat failed: %s", exc)
                 continue
-            alive = {result.job_id: result for result in results}
+            # Keyed by token: a stale and a live attempt of the same job can both be in `renew`.
+            alive = {result.lease_token: result for result in results}
             for ctx in renew:
-                result = alive.get(ctx.job_id)
+                result = alive.get(ctx.lease_token)
                 if result is None:
                     with self._lock:
                         still_running = ctx.lease_token in self._inflight
